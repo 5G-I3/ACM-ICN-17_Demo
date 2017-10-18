@@ -1,0 +1,43 @@
+diff --git a/pkg/ccn-lite/Makefile b/pkg/ccn-lite/Makefile
+index df6d6813a..ca7a8522d 100644
+--- a/pkg/ccn-lite/Makefile
++++ b/pkg/ccn-lite/Makefile
+@@ -1,6 +1,6 @@
+ PKG_NAME=ccn-lite
+-PKG_URL=https://github.com/cn-uofbasel/ccn-lite/
+-PKG_VERSION=7b973a737dba47fe6c1ee2d58e06dd9a22209fde
++PKG_URL=<CHANGE_TO_YOUR_REPO>
++PKG_VERSION=<CHANGE_TO_YOUR_COMMIT_HASH>
+ PKG_LICENSE=ISC
+ 
+ .PHONY: all
+diff --git a/pkg/ccn-lite/Makefile.include b/pkg/ccn-lite/Makefile.include
+index 8718a60ed..cc432c057 100644
+--- a/pkg/ccn-lite/Makefile.include
++++ b/pkg/ccn-lite/Makefile.include
+@@ -1,4 +1,6 @@
+ INCLUDES += -I$(RIOTPKG)/ccn-lite -I$(PKGDIRBASE)/ccn-lite/src
+ INCLUDES += -I$(RIOTBASE)/sys/posix/include
++INCLUDES += -I$(PKGDIRBASE)/ccn-lite/src/COMPAS/include
+ 
+ CFLAGS += -DCCNL_RIOT
++CFLAGS += -DUSE_SUITE_COMPAS
+diff --git a/pkg/ccn-lite/ccn-lite-riot.h b/pkg/ccn-lite/ccn-lite-riot.h
+index 71aa14e25..3e3da481e 100644
+--- a/pkg/ccn-lite/ccn-lite-riot.h
++++ b/pkg/ccn-lite/ccn-lite-riot.h
+@@ -170,6 +170,14 @@ typedef struct {
+ #define CCNL_CACHE_SIZE
+ #endif
+ 
++#define EXPORTER_PERIODIC               (0xEE00)
++#define EXPORTER_EVENT_PARENT_ADD       (0xEE01)
++#define EXPORTER_EVENT_PARENT_DROP      (0xEE02)
++#define EXPORTER_EVENT_CON_CACHE_ADD    (0xEE03)
++#define EXPORTER_EVENT_NAM_CACHE_ADD    (0xEE04)
++#define EXPORTER_EVENT_NAM_CACHE_DEL    (0xEE05)
++#define EXPORTER_EVENT_PARENT_REFRESH   (0xEE06)
++
+ /**
+  * Struct holding CCN-Lite's central relay information
+  */
