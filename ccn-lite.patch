@@ -1,0 +1,1143 @@
+diff --git a/.gitignore b/.gitignore
+index b3802b6d..56af75bc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -77,4 +77,6 @@ distribution/Debian/ccn-lite
+ distribution/Debian/ccn-lite.deb
+ distribution/RedHat/rpmbuild
+ 
++src/COMPAS
++
+ # eof
+diff --git a/src/Makefile b/src/Makefile
+index ccdeb812..cfda2c84 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -163,13 +163,24 @@ OMNET_DEPS = ccnl-core.c ccnl-core-fwd.c ccnl-core.h ccnl-core-util.c ccnl-defs.
+ all: ${PROGS}
+ 	$(MAKE) -C util
+ 
++libcompas.a: TARGET_ARCH:=
++libcompas.a:
++	$(RM)r COMPAS && \
++	git clone https://github.com/cgundogan/COMPAS.git && \
++	"$(MAKE)" -BC COMPAS
++
++lib-ccn-lite.a: CCNLCFLAGS+=-ICOMPAS/include -DUSE_SUITE_COMPAS
+ lib-ccn-lite.a: ccn-lite-riot.c \
+-	${SUITE_LIBS} ${CCNL_CORE_LIB} ${CCNL_PLATFORM_LIB}
+-	${CC} -o $@ ${RIOT_CFLAGS} ${CCNLCFLAGS} -c $<
++	${SUITE_LIBS} ${CCNL_CORE_LIB} ${CCNL_PLATFORM_LIB} libcompas.a
++	${CC} -o ${<:%.c=%.o} ${RIOT_CFLAGS} ${CCNLCFLAGS} -c $<
++	${AR} x COMPAS/libcompas.a
++	${AR} rcs $@ *.o
+ 
++lib-ccn-lite-utils.a: CCNLCFLAGS+=-ICOMPAS/include -DUSE_SUITE_COMPAS
+ lib-ccn-lite-utils.a: ${UTIL_LIB} util/base64.c util/ccnl-common.c
+ 	${AR} rcs $@ ${UTIL_LIB}
+ 
++$(UTIL_LIB): CCNLCFLAGS+=-ICOMPAS/include -DUSE_SUITE_COMPAS
+ $(UTIL_LIB): %.o: %.c
+ 	${CC} -o $@ ${RIOT_CFLAGS} ${CCNLCFLAGS} -c $<
+ 
+@@ -186,7 +197,9 @@ ccn-nfn-relay-nack: ${CCNL_RELAY_LIB}
+ 	${CC} -o $@ ${CCNLCFLAGS} ${NACKFLAGS} $< ${EXTLIBS}
+ 	@${CREATE_BIN}
+ 
+-ccn-lite-relay: ${CCNL_RELAY_LIB}
++ccn-lite-relay: CCNLCFLAGS+=-ICOMPAS/include -DUSE_SUITE_COMPAS ./COMPAS/libcompas.a
++ccn-lite-relay: EXTLIBS+=./COMPAS/libcompas.a
++ccn-lite-relay: ${CCNL_RELAY_LIB} libcompas.a
+ 	${CC} -o $@ ${CCNLCFLAGS} $< ${EXTLIBS}
+ 	@${CREATE_BIN}
+ 
+diff --git a/src/ccn-lite-compas.c b/src/ccn-lite-compas.c
+new file mode 100644
+index 00000000..aa7e6e37
+--- /dev/null
++++ b/src/ccn-lite-compas.c
+@@ -0,0 +1,359 @@
++/*
++ * @f ccn-lite-compas.c
++ * @b COMPAS adaption layer
++ *
++ * Copyright (C) 2017, Cenk Gündoğan, HAW Hamburg
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ * File history:
++ * 2017-05-12 created
++ */
++
++#include "arpa/inet.h"
++#include "sys/socket.h"
++#include "ccnl-defs.h"
++#include "ccnl-core.h"
++#include "ccnl-headers.h"
++
++#include "compas/routing/nam.h"
++#include "compas/routing/pam.h"
++#include "compas/routing/sol.h"
++
++#if defined(CCNL_RIOT)
++extern kernel_pid_t exporter_pid;
++#endif
++
++void ccnl_compas_send_sol(void *arg1, void *arg2);
++
++void compas_dodag_parent_timeout(struct ccnl_relay_s *ccnl)
++{
++    ccnl->compas_dodag_parent_timeout = 1;
++    ccnl->dodag.flags |= COMPAS_DODAG_FLAGS_FLOATING;
++#ifdef CCNL_RIOT
++    xtimer_remove(&ccnl->compas_sol_timer);
++    xtimer_set_msg(&ccnl->compas_sol_timer, COMPAS_SOL_PERIOD, &ccnl->compas_sol_msg, sched_active_pid);
++#else
++    ccnl_rem_timer(ccnl->compas_sol_timer);
++    ccnl->compas_sol_timer = ccnl_set_timer(COMPAS_SOL_PERIOD, ccnl_compas_send_sol, ccnl, NULL);
++#endif
++}
++
++#if defined(CCNL_RIOT)
++bool compas_send(struct ccnl_relay_s *ccnl, void *param, uint8_t *addr, uint8_t addr_len)
++{
++    gnrc_pktsnip_t *pkt = (gnrc_pktsnip_t *) param;
++    gnrc_pktsnip_t *hdr = gnrc_netif_hdr_build(NULL, 0, addr, addr_len);
++
++    if (hdr == NULL) {
++        puts("error: packet buffer full");
++        gnrc_pktbuf_release(pkt);
++        return false;
++    }
++
++    LL_PREPEND(pkt, hdr);
++
++    if (!addr) {
++        gnrc_netif_hdr_t *nethdr = (gnrc_netif_hdr_t *)hdr->data;
++        nethdr->flags = GNRC_NETIF_HDR_FLAGS_BROADCAST;
++    }
++
++    struct ccnl_if_s *ifc = NULL;
++    for (int i = 0; i < ccnl->ifcount; i++) {
++        if (ccnl->ifs[i].if_pid != 0) {
++            ifc = &ccnl->ifs[i];
++            break;
++        }
++    }
++
++    if (gnrc_netapi_send(ifc->if_pid, pkt) < 1) {
++        puts("error: unable to send\n");
++        gnrc_pktbuf_release(pkt);
++        return false;
++    }
++    return true;
++}
++#endif
++
++void compas_send_sol(struct ccnl_relay_s *ccnl)
++{
++    compas_dodag_t *dodag = &ccnl->dodag;
++    (void) dodag;
++
++#if defined(CCNL_RIOT)
++    gnrc_pktsnip_t *pkt = gnrc_pktbuf_add(NULL, NULL, compas_sol_len() + 2, GNRC_NETTYPE_CCN);
++
++    if (pkt == NULL) {
++        puts("error: packet buffer full");
++        return;
++    }
++
++    ((uint8_t *) pkt->data)[0] = 0x80;
++    ((uint8_t *) pkt->data)[1] = CCNL_ENC_COMPAS;
++
++    if ((dodag->rank != COMPAS_DODAG_UNDEF) && (ccnl->compas_sol_num <= 3)) {
++        compas_sol_create((compas_sol_t *) (((uint8_t *) pkt->data) + 2), 0);
++        compas_send(ccnl, pkt, dodag->parent.face.face_addr, dodag->parent.face.face_addr_len);
++    }
++    else {
++#if defined(CCNL_RIOT)
++        if ((dodag->rank != COMPAS_DODAG_UNDEF) && (ccnl->compas_sol_num == 4) && (exporter_pid != KERNEL_PID_UNDEF)) {
++            msg_t m;
++            m.type = EXPORTER_EVENT_PARENT_DROP;
++            m.content.ptr = NULL;
++            msg_try_send(&m, exporter_pid);
++        }
++#endif
++        compas_sol_create((compas_sol_t *) (((uint8_t *) pkt->data) + 2), COMPAS_SOL_FLAGS_TRICKLE);
++        compas_send(ccnl, pkt, NULL, 0);
++    }
++#else
++#ifdef USE_WPAN
++    struct ccnl_buf_s *buf;
++    int datalen = sizeof(*buf) + compas_sol_len() + 2;
++    buf = ccnl_malloc(datalen);
++    buf->data[0] = 0x80;
++    buf->data[1] = CCNL_ENC_COMPAS;
++    compas_pam_create(dodag, (compas_pam_t *) (buf->data + 2));
++    buf->next = NULL;
++    buf->datalen = compas_sol_len() + 2;
++
++    struct ccnl_face_s *face = NULL;
++    if (dodag->rank != COMPAS_DODAG_UNDEF) {
++        face = ccnl->dodag_face;
++    }
++    else {
++        sockunion sun;
++        /* initialize address with 0xFF for broadcast */
++        sun.sa.sa_family = AF_IEEE802154;
++        sun.wpan.addr.addr_type = IEEE802154_ADDR_SHORT;
++        sun.wpan.addr.pan_id = 0xffff;
++        sun.wpan.addr.addr.short_addr = 0xffff;
++
++        face = ccnl_get_face_or_create(ccnl, 0, &sun.sa, sizeof(sun.wpan));
++    }
++    if (face) {
++        ccnl_face_enqueue(ccnl, face, buf);
++    }
++#endif
++#endif
++}
++
++void compas_send_pam(struct ccnl_relay_s *ccnl, struct ccnl_face_s *face)
++{
++    compas_dodag_t *dodag = &ccnl->dodag;
++    (void) dodag;
++    (void) face;
++
++#if defined(CCNL_RIOT)
++    gnrc_pktsnip_t *pkt = gnrc_pktbuf_add(NULL, NULL, compas_pam_len(dodag) + 2, GNRC_NETTYPE_CCN);
++
++    if (pkt == NULL) {
++        puts("error: packet buffer full");
++        return;
++    }
++
++    ((uint8_t *) pkt->data)[0] = 0x80;
++    ((uint8_t *) pkt->data)[1] = CCNL_ENC_COMPAS;
++    compas_pam_create(dodag, (compas_pam_t *) (((uint8_t *) pkt->data) + 2));
++
++    if (face) {
++        compas_send(ccnl, pkt, face->peer.linklayer.sll_addr, face->peer.linklayer.sll_halen);
++    }
++    else {
++        compas_send(ccnl, pkt, NULL, 0);
++    }
++#else
++#ifdef USE_WPAN
++    struct ccnl_buf_s *buf;
++    int datalen = sizeof(*buf) + compas_pam_len(dodag) + 2;
++    buf = ccnl_malloc(datalen);
++    buf->data[0] = 0x80;
++    buf->data[1] = CCNL_ENC_COMPAS;
++    compas_pam_create(dodag, (compas_pam_t *) (buf->data + 2));
++    buf->next = NULL;
++    buf->datalen = compas_pam_len(dodag) + 2;
++
++    if (face == NULL) {
++        sockunion sun;
++        /* initialize address with 0xFF for broadcast */
++        sun.sa.sa_family = AF_IEEE802154;
++        sun.wpan.addr.addr_type = IEEE802154_ADDR_SHORT;
++        sun.wpan.addr.pan_id = 0xffff;
++        sun.wpan.addr.addr.short_addr = 0xffff;
++        face = ccnl_get_face_or_create(ccnl, 0, &sun.sa, sizeof(sun.wpan));
++    }
++
++    if (face) {
++        ccnl_face_enqueue(ccnl, face, buf);
++    }
++#endif
++#endif
++}
++
++bool compas_send_nam(struct ccnl_relay_s *ccnl, const compas_name_t *name)
++{
++    compas_dodag_t *dodag = &ccnl->dodag;
++
++    if (dodag->rank == COMPAS_DODAG_UNDEF) {
++        puts("Error: not part of a DODAG");
++        return false;
++    }
++
++#if defined(CCNL_RIOT)
++    gnrc_pktsnip_t *pkt = gnrc_pktbuf_add(NULL, NULL,
++                                          2 + sizeof(compas_nam_t) +
++                                          name->name_len + sizeof(compas_tlv_t),
++                                          GNRC_NETTYPE_CCN);
++
++    if (pkt == NULL) {
++        puts("error: packet buffer full");
++        return false;
++    }
++
++    ((uint8_t *) pkt->data)[0] = 0x80;
++    ((uint8_t *) pkt->data)[1] = CCNL_ENC_COMPAS;
++    compas_nam_t *nam = (compas_nam_t *)(((uint8_t *) pkt->data) + 2);
++    compas_nam_create(nam);
++    compas_nam_tlv_add_name(nam, name);
++
++    if (nam->len == 0) {
++        gnrc_pktbuf_release(pkt);
++        return false;
++    }
++
++    gnrc_pktbuf_realloc_data(pkt, 2 + nam->len + sizeof(*nam));
++    return compas_send(ccnl, pkt, dodag->parent.face.face_addr, dodag->parent.face.face_addr_len);
++
++#else
++#ifdef USE_WPAN
++    struct ccnl_buf_s *buf;
++    int datalen = sizeof(*buf) + 2 + sizeof(compas_nam_t) + name->name_len +
++                  sizeof(compas_tlv_t);
++    buf = ccnl_malloc(datalen);
++    buf->data[0] = 0x80;
++    buf->data[1] = CCNL_ENC_COMPAS;
++    compas_nam_t *nam = (compas_nam_t *)(buf->data + 2);
++    compas_nam_create(nam);
++    compas_nam_tlv_add_name(nam, name);
++    buf->next = NULL;
++    buf->datalen = datalen;
++
++    if (ccnl->dodag_face) {
++        ccnl_face_enqueue(ccnl, ccnl->dodag_face, buf);
++        return true;
++    }
++
++#endif
++    return false;
++#endif
++}
++
++bool compas_handle_nam(struct ccnl_relay_s *ccnl)
++{
++    bool work_to_do = false;
++    ccnl->compas_nam_timer_running = 0;
++    if ((ccnl->dodag.rank != COMPAS_DODAG_ROOT_RANK) && !ccnl->compas_dodag_parent_timeout) {
++        for (compas_nam_cache_entry_t *n = ccnl->dodag.nam_cache;
++             n < ccnl->dodag.nam_cache + COMPAS_NAM_CACHE_LEN;
++             ++n) {
++            if (n->in_use) {
++                if (n->retries--) {
++                    compas_send_nam(ccnl, &n->name);
++                    work_to_do = true;
++                }
++                else {
++                    bool found = false;
++                    for (struct ccnl_content_s *c = ccnl->contents; c; c = c->next) {
++                        char *spref = ccnl_prefix_to_path(c->pkt->pfx);
++                        if (memcmp(n->name.name, spref, strlen(spref)) == 0) {
++                            found = true;
++                            break;
++                        }
++                        ccnl_free(spref);
++                    }
++                    if (!found) {
++#if defined(CCNL_RIOT)
++                        if (exporter_pid != KERNEL_PID_UNDEF) {
++                            msg_t m;
++                            m.type = EXPORTER_EVENT_NAM_CACHE_DEL;
++                            m.content.ptr = NULL;
++                            msg_try_send(&m, exporter_pid);
++                        }
++#endif
++                        memset(n, 0, sizeof(*n));
++                    }
++                    else {
++                        n->retries = COMPAS_NAM_CACHE_RETRIES;
++                        compas_dodag_parent_timeout(ccnl);
++                        work_to_do = false;
++                    }
++                    break;
++                }
++            }
++        }
++    }
++
++    if (work_to_do) {
++        ccnl->compas_nam_timer_running = 1;
++    }
++
++    return work_to_do;
++}
++
++#ifndef CCNL_RIOT
++void ccnl_compas_send_pam(void *arg1, void *arg2)
++{
++    (void) arg2;
++    struct ccnl_relay_s *ccnl = (struct ccnl_relay_s *) arg1;
++
++    if (ccnl->dodag.rank != COMPAS_DODAG_UNDEF) {
++        compas_send_pam(ccnl, NULL);
++        uint64_t trickle_int = trickle_next(&ccnl->pam_trickle);
++        ccnl_set_timer(trickle_int * 1000, ccnl_compas_send_pam, ccnl, NULL);
++    }
++}
++
++void ccnl_compas_send_nam(void *arg1, void *arg2)
++{
++    (void) arg2;
++    struct ccnl_relay_s *ccnl = (struct ccnl_relay_s *) arg1;
++
++    if (compas_handle_nam(ccnl)) {
++        ccnl_set_timer(COMPAS_NAM_PERIOD, ccnl_compas_send_nam, ccnl, NULL);
++    }
++}
++
++void ccnl_compas_send_sol(void *arg1, void *arg2)
++{
++    (void) arg2;
++    struct ccnl_relay_s *ccnl = (struct ccnl_relay_s *) arg1;
++
++    ccnl->compas_sol_num++;
++    if (ccnl->dodag.rank == COMPAS_DODAG_UNDEF || ccnl->compas_dodag_parent_timeout) {
++        compas_send_sol(ccnl);
++        ccnl->compas_sol_timer = ccnl_set_timer(COMPAS_SOL_PERIOD, ccnl_compas_send_sol, ccnl, NULL);
++    }
++    else {
++        ccnl->compas_sol_num = 0;
++    }
++}
++
++void ccnl_compas_timeout(void *arg1, void *arg2)
++{
++    (void) arg2;
++    struct ccnl_relay_s *ccnl = (struct ccnl_relay_s *) arg1;
++
++    compas_dodag_parent_timeout(ccnl);
++}
++#endif
+diff --git a/src/ccn-lite-relay.c b/src/ccn-lite-relay.c
+index 393cd263..9e8818da 100644
+--- a/src/ccn-lite-relay.c
++++ b/src/ccn-lite-relay.c
+@@ -87,6 +87,11 @@
+ #include "ccnl-ext-frag.c"
+ #include "ccnl-ext-crypto.c"
+ 
++#ifdef USE_SUITE_COMPAS
++#include "compas/routing/dodag.h"
++#include "compas/compas.h"
++#endif
++
+ // ----------------------------------------------------------------------
+ 
+ struct ccnl_relay_s theRelay;
+@@ -148,6 +153,9 @@ ccnl_open_wpandev(char *devname, struct sockaddr_ieee802154 *swpan)
+         return -1;
+     }
+ 
++    int optval = 0;
++    setsockopt(s, 0, 0, &optval, sizeof(optval));
++
+     memset(&ifr, 0, sizeof(ifr));
+     strncpy(ifr.ifr_name, (char*) devname, IFNAMSIZ);
+     if(ioctl(s, SIOCGIFHWADDR, (void *) &ifr) < 0 ) {
+@@ -290,6 +298,9 @@ int
+ ccnl_wpan_sendto(int sock, unsigned char *data, int datalen,
+                  struct sockaddr_ieee802154 *dst)
+ {
++    int optval = 0;
++    setsockopt(sock, 0, 0, &optval, sizeof(optval));
++
+     return sendto(sock, data, datalen, 0, (struct sockaddr *)dst,
+                   sizeof(struct sockaddr_ieee802154));
+ }
+@@ -631,6 +642,15 @@ ccnl_io_loop(struct ccnl_relay_s *ccnl)
+     maxfd++;
+ 
+     DEBUGMSG(INFO, "starting main event and IO loop\n");
++
++#ifdef USE_SUITE_COMPAS
++    char *compas_prefix = "/HAW";
++    compas_dodag_init_root(&ccnl->dodag, compas_prefix, strlen(compas_prefix));
++    trickle_init(&ccnl->pam_trickle, TRICKLE_IMIN, TRICKLE_IMAX, TRICKLE_REDCONST);
++    uint64_t trickle_int = trickle_next(&ccnl->pam_trickle);
++    ccnl->compas_pam_timer = ccnl_set_timer(trickle_int * 1000, ccnl_compas_send_pam, ccnl, NULL);
++#endif
++
+     while (!ccnl->halt_flag) {
+         int usec;
+ 
+@@ -691,9 +711,8 @@ ccnl_io_loop(struct ccnl_relay_s *ccnl)
+ #endif
+ #ifdef USE_WPAN
+                     else if (src_addr.sa.sa_family == AF_IEEE802154) {
+-                        if (len > 14)
+-                            ccnl_core_RX(ccnl, i, buf, len,
+-                                         &src_addr.sa, sizeof(src_addr.linklayer));
++                        ccnl_core_RX(ccnl, i, buf, len,
++                                     &src_addr.sa, sizeof(src_addr.linklayer));
+                     }
+ #endif
+ #ifdef USE_UNIXSOCKET
+diff --git a/src/ccn-lite-riot.c b/src/ccn-lite-riot.c
+index 3b8db4d3..c2a2fdcc 100644
+--- a/src/ccn-lite-riot.c
++++ b/src/ccn-lite-riot.c
+@@ -451,6 +451,16 @@ void
+     msg_init_queue(_msg_queue, CCNL_QUEUE_SIZE);
+     struct ccnl_relay_s *ccnl = (struct ccnl_relay_s*) arg;
+ 
++#ifdef USE_SUITE_COMPAS
++    ccnl->compas_sol_num = 0;
++    ccnl->compas_pam_msg.type = COMPAS_PAM_MSG;
++    ccnl->compas_nam_msg.type = COMPAS_NAM_MSG;
++    ccnl->compas_sol_msg.type = COMPAS_SOL_MSG;
++    ccnl->compas_dodag_parent_msg.type = COMPAS_DODAG_PARENT_TIMEOUT_MSG;
++    ccnl->compas_started = 0;
++    xtimer_set_msg(&ccnl->compas_sol_timer, COMPAS_SOL_PERIOD,
++                   &ccnl->compas_sol_msg, sched_active_pid);
++#endif
+ 
+     /* XXX: https://xkcd.com/221/ */
+     random_init(0x4);
+@@ -493,6 +503,41 @@ void
+                 xtimer_remove(&_ageing_timer);
+                 xtimer_set_msg(&_ageing_timer, US_PER_SEC, &reply, sched_active_pid);
+                 break;
++#ifdef USE_SUITE_COMPAS
++            case COMPAS_PAM_MSG:
++                if (ccnl->dodag.rank != COMPAS_DODAG_UNDEF) {
++                    compas_send_pam(ccnl, NULL);
++                    uint64_t trickle_int = trickle_next(&ccnl->pam_trickle);
++                    xtimer_set_msg64(&ccnl->compas_pam_timer, trickle_int * 1000,
++                                   &ccnl->compas_pam_msg, sched_active_pid);
++                }
++                break;
++            case COMPAS_NAM_MSG:
++                if (compas_handle_nam(ccnl)) {
++                    xtimer_set_msg(&ccnl->compas_nam_timer, COMPAS_NAM_PERIOD, &ccnl->compas_nam_msg, sched_active_pid);
++                }
++                break;
++            case COMPAS_SOL_MSG:
++                ccnl->compas_sol_num++;
++                if (ccnl->dodag.rank == COMPAS_DODAG_UNDEF || ccnl->compas_dodag_parent_timeout) {
++                    compas_send_sol(ccnl);
++                    xtimer_set_msg(&ccnl->compas_sol_timer, COMPAS_SOL_PERIOD,
++                                   &ccnl->compas_sol_msg, sched_active_pid);
++                }
++                else {
++                    ccnl->compas_sol_num = 0;
++                }
++                break;
++            case COMPAS_PUB_MSG:
++                if (!ccnl->compas_nam_timer_running) {
++                    ccnl->compas_nam_timer_running = 1;
++                    msg_try_send(&ccnl->compas_nam_msg, sched_active_pid);
++                }
++                break;
++            case COMPAS_DODAG_PARENT_TIMEOUT_MSG:
++                compas_dodag_parent_timeout(ccnl);
++                break;
++#endif
+             default:
+                 DEBUGMSG(WARNING, "ccn-lite: unknown message type\n");
+                 break;
+@@ -512,7 +557,7 @@ ccnl_start(void)
+     ccnl_relay.max_cache_entries = CCNL_CACHE_SIZE;
+     ccnl_relay.max_pit_entries = CCNL_DEFAULT_MAX_PIT_ENTRIES;
+     /* start the CCN-Lite event-loop */
+-    _ccnl_event_loop_pid =  thread_create(_ccnl_stack, sizeof(_ccnl_stack),
++    ccnl_relay.pid = _ccnl_event_loop_pid =  thread_create(_ccnl_stack, sizeof(_ccnl_stack),
+                                           THREAD_PRIORITY_MAIN - 1,
+                                           THREAD_CREATE_STACKTEST, _ccnl_event_loop,
+                                           &ccnl_relay, "ccnl");
+diff --git a/src/ccnl-core-fwd.c b/src/ccnl-core-fwd.c
+index e4d7a363..1411f9fe 100644
+--- a/src/ccnl-core-fwd.c
++++ b/src/ccnl-core-fwd.c
+@@ -259,7 +259,6 @@ ccnl_fwd_handleInterest(struct ccnl_relay_s *relay, struct ccnl_face_s *from,
+     }
+ #endif
+ 
+-
+     // Step 1: search in content store
+     DEBUGMSG_CFWD(DEBUG, "  searching in CS\n");
+ 
+@@ -277,6 +276,28 @@ ccnl_fwd_handleInterest(struct ccnl_relay_s *relay, struct ccnl_face_s *from,
+         } else {
+             ccnl_app_RX(relay, c);
+         }
++#ifdef USE_SUITE_COMPAS
++        compas_face_t face;
++        compas_face_init(&face, from->peer.linklayer.sll_addr, from->peer.linklayer.sll_halen);
++        char *spref = ccnl_prefix_to_path((*pkt)->pfx);
++        compas_name_t cname;
++        compas_name_init(&cname, spref, strlen(spref));
++        if (compas_dodag_parent_eq(&relay->dodag, &face)) {
++            compas_nam_cache_entry_t *n = compas_nam_cache_find(&relay->dodag, &cname);
++            if (n) {
++                memset(n, 0, sizeof(*n));
++#if defined(CCNL_RIOT)
++                if (exporter_pid != KERNEL_PID_UNDEF) {
++                    msg_t m;
++                    m.type = EXPORTER_EVENT_NAM_CACHE_DEL;
++                    m.content.ptr = NULL;
++                    msg_try_send(&m, exporter_pid);
++                }
++#endif
++            }
++        }
++        ccnl_free(spref);
++#endif
+         return 0; // we are done
+     }
+ 
+@@ -319,7 +340,23 @@ ccnl_fwd_handleInterest(struct ccnl_relay_s *relay, struct ccnl_face_s *from,
+     if (i) { // store the I request, for the incoming face (Step 3)
+         DEBUGMSG_CFWD(DEBUG, "  appending interest entry %p\n", (void *) i);
+         ccnl_interest_append_pending(i, from);
++#ifdef USE_SUITE_COMPAS
++        compas_face_t face;
++        compas_face_init(&face, from->peer.linklayer.sll_addr, from->peer.linklayer.sll_halen);
++        char *spref = ccnl_prefix_to_path((*pkt)->pfx);
++        compas_name_t cname;
++        compas_name_init(&cname, spref, strlen(spref));
++        if (compas_dodag_parent_eq(&relay->dodag, &face)) {
++            compas_nam_cache_entry_t *n = compas_nam_cache_find(&relay->dodag, &cname);
++            if (n) {
++                return 0;
++            }
++        }
++        ccnl_free(spref);
+         ccnl_interest_propagate(relay, i);
++#else
++        ccnl_interest_propagate(relay, i);
++#endif
+     }
+ 
+     /*
+diff --git a/src/ccnl-core-util.c b/src/ccnl-core-util.c
+index 9c836c43..39a61364 100644
+--- a/src/ccnl-core-util.c
++++ b/src/ccnl-core-util.c
+@@ -109,6 +109,9 @@ const char *compile_string = ""
+ #endif
+ #ifdef USE_UNIXSOCKET
+         "UNIXSOCKET, "
++#endif
++#ifdef USE_SUITE_COMPAS
++        "SUITE_COMPAS, "
+ #endif
+         ;
+ 
+@@ -376,6 +379,10 @@ ccnl_isSuite(int suite)
+ #ifdef USE_SUITE_NDNTLV
+     if (suite == CCNL_SUITE_NDNTLV)
+         return true;
++#endif
++#ifdef USE_SUITE_COMPAS
++    if (suite == CCNL_SUITE_COMPAS)
++        return true;
+ #endif
+     return false;
+ }
+diff --git a/src/ccnl-core.c b/src/ccnl-core.c
+index 03def5fe..5f357fb4 100644
+--- a/src/ccnl-core.c
++++ b/src/ccnl-core.c
+@@ -24,6 +24,17 @@
+ 
+ #include "ccnl-ext.h"
+ 
++#ifdef USE_SUITE_COMPAS
++#include "compas/compas.h"
++#include "ccnl-headers.h"
++#include <stdlib.h>
++#include "ccn-lite-compas.c"
++#endif
++
++#if defined(CCNL_RIOT)
++extern kernel_pid_t exporter_pid;
++#endif
++
+ #ifndef USE_NFN
+ # define ccnl_nfn_interest_remove(r,i)  ccnl_interest_remove(r,i)
+ #endif
+@@ -496,6 +507,13 @@ ccnl_interest_propagate(struct ccnl_relay_s *ccnl, struct ccnl_interest_s *i)
+     for (fwd = ccnl->fib; fwd; fwd = fwd->next) {
+         if (!fwd->prefix)
+             continue;
++#ifdef CCNL_RIOT
++        compas_face_t face;
++        compas_face_init(&face, fwd->face->peer.linklayer.sll_addr, fwd->face->peer.linklayer.sll_halen);
++        if (compas_dodag_parent_eq(&ccnl->dodag, &face)) {
++            continue;
++        }
++#endif
+ 
+         //Only for matching suite
+         if (!i->pkt->pfx || fwd->suite != i->pkt->pfx->suite) {
+@@ -718,6 +736,25 @@ ccnl_content_remove(struct ccnl_relay_s *ccnl, struct ccnl_content_s *c)
+     struct ccnl_content_s *c2;
+     DEBUGMSG_CORE(TRACE, "ccnl_content_remove\n");
+ 
++#ifdef USE_SUITE_COMPAS
++    char *spref = ccnl_prefix_to_path(c->pkt->pfx);
++    compas_name_t cname;
++    compas_name_init(&cname, spref, strlen(spref));
++    compas_nam_cache_entry_t *n = compas_nam_cache_find(&ccnl->dodag, &cname);
++    if (n) {
++        memset(n, 0, sizeof(*n));
++#if defined(CCNL_RIOT)
++        if (exporter_pid != KERNEL_PID_UNDEF) {
++            msg_t m;
++            m.type = EXPORTER_EVENT_NAM_CACHE_DEL;
++            m.content.ptr = NULL;
++            msg_try_send(&m, exporter_pid);
++        }
++#endif
++    }
++    ccnl_free(spref);
++#endif
++
+     c2 = c->next;
+     DBL_LINKED_LIST_REMOVE(ccnl->contents, c);
+ 
+@@ -777,6 +814,15 @@ ccnl_content_add2cache(struct ccnl_relay_s *ccnl, struct ccnl_content_s *c)
+             ccnl->contentcnt++;
+     }
+ 
++#if defined(CCNL_RIOT)
++    if (exporter_pid != KERNEL_PID_UNDEF) {
++        msg_t m;
++        m.type = EXPORTER_EVENT_CON_CACHE_ADD;
++        m.content.ptr = (void *) c;
++        msg_try_send(&m, exporter_pid);
++    }
++#endif
++
+     return c;
+ }
+ 
+@@ -871,8 +917,8 @@ ccnl_content_serve_pending(struct ccnl_relay_s *ccnl, struct ccnl_content_s *c)
+ 
+         //Hook for add content to cache by callback:
+         if(i && ! i->pending){
+-            DEBUGMSG_CORE(WARNING, "releasing interest 0x%p OK?\n", (void*)i);
+-            c->flags |= CCNL_CONTENT_FLAGS_STATIC;
++            //DEBUGMSG_CORE(WARNING, "releasing interest 0x%p OK?\n", (void*)i);
++            //c->flags |= CCNL_CONTENT_FLAGS_STATIC;
+             i = ccnl_interest_remove(ccnl, i);
+             return 1;
+         }
+@@ -932,12 +978,15 @@ ccnl_do_ageing(void *ptr, void *dummy)
+ {
+     (void) dummy;
+     struct ccnl_relay_s *relay = (struct ccnl_relay_s*) ptr;
++#ifndef USE_SUITE_COMPAS
+     struct ccnl_content_s *c = relay->contents;
++#endif
+     struct ccnl_interest_s *i = relay->pit;
+     struct ccnl_face_s *f = relay->faces;
+     time_t t = CCNL_NOW();
+     DEBUGMSG_CORE(VERBOSE, "ageing t=%d\n", (int)t);
+ 
++#ifndef USE_SUITE_COMPAS
+     while (c) {
+         if ((c->last_used + CCNL_CONTENT_TIMEOUT) <= t &&
+                                 !(c->flags & CCNL_CONTENT_FLAGS_STATIC)){
+@@ -961,6 +1010,7 @@ ccnl_do_ageing(void *ptr, void *dummy)
+         else
+             c = c->next;
+     }
++#endif
+     while (i) { // CONFORM: "Entries in the PIT MUST timeout rather
+                 // than being held indefinitely."
+         if ((i->last_used + CCNL_INTEREST_TIMEOUT) <= t ||
+@@ -1001,6 +1051,34 @@ ccnl_do_ageing(void *ptr, void *dummy)
+ //                 i = i->next;
+ #else // USE_TIMEOUT
+                 DEBUGMSG_AGEING("AGING: REMOVE INTEREST", "timeout: remove interest");
++#ifdef USE_SUITE_COMPAS
++                if (i->to) {
++                    char *spref = ccnl_prefix_to_path(i->pkt->pfx);
++                    compas_name_t cname;
++                    compas_name_init(&cname, spref, strlen(spref));
++                    compas_nam_cache_entry_t *n = compas_nam_cache_find(&relay->dodag, &cname);
++                    if (n) {
++                        memset(n, 0, sizeof(*n));
++#if defined(CCNL_RIOT)
++                        if (exporter_pid != KERNEL_PID_UNDEF) {
++                            msg_t m;
++                            m.type = EXPORTER_EVENT_NAM_CACHE_DEL;
++                            m.content.ptr = NULL;
++                            msg_try_send(&m, exporter_pid);
++                        }
++#endif
++                        if (relay->compas_nam_timer_running == 0) {
++                            relay->compas_nam_timer_running = 1;
++#ifdef CCNL_RIOT
++                            msg_try_send(&relay->compas_nam_msg, sched_active_pid);
++#else
++                            ccnl_compas_send_nam((void *) relay, NULL);
++#endif
++                        }
++                    }
++                    ccnl_free(spref);
++                }
++#endif
+                 i = ccnl_nfn_interest_remove(relay, i);
+ #endif
+         } else {
+@@ -1014,7 +1092,21 @@ ccnl_do_ageing(void *ptr, void *dummy)
+             if (i->flags & CCNL_PIT_COREPROPAGATES){
+ #endif
+                 DEBUGMSG_CORE(TRACE, "AGING: PROPAGATING INTEREST %p\n", (void*) i);
++#ifdef USE_SUITE_COMPAS
++                char *spref = ccnl_prefix_to_path(i->pkt->pfx);
++                compas_name_t cname;
++                compas_name_init(&cname, spref, strlen(spref));
++                compas_nam_cache_entry_t *n = compas_nam_cache_find(&relay->dodag, &cname);
++                if (n && i->to) {
++                    ccnl_face_enqueue(relay, i->to, buf_dup(i->pkt->buf));
++                }
++                else {
++                    ccnl_interest_propagate(relay, i);
++                }
++                ccnl_free(spref);
++#else
+                 ccnl_interest_propagate(relay, i);
++#endif
+ #ifdef USE_NFN
+             }
+ #endif
+@@ -1124,6 +1216,11 @@ ccnl_core_RX(struct ccnl_relay_s *relay, int ifndx, unsigned char *data,
+                     ccnl_addr2ascii(&from->peer));
+     }
+ 
++    if(from->peer.linklayer.sll_halen == 0) {
++        ccnl_face_remove(relay, from);
++        return;
++    }
++
+     // loop through all packets in the received frame (UDP, Ethernet etc)
+     while (datalen > 0) {
+         // work through explicit code switching
+@@ -1154,6 +1251,187 @@ ccnl_core_RX(struct ccnl_relay_s *relay, int ifndx, unsigned char *data,
+ 
+ // ----------------------------------------------------------------------
+ 
++#ifdef USE_SUITE_COMPAS
++int ccnl_compas_forwarder(struct ccnl_relay_s *relay, struct ccnl_face_s *from, unsigned char **data, int *datalen)
++{
++    compas_message_t *cmsg = (compas_message_t *) *data;
++
++    /* mark parsing of message completed */
++    *datalen = 0;
++
++    /*
++    if (!relay->compas_started) {
++        return 0;
++    }
++    */
++
++    if (cmsg->type == COMPAS_MSG_TYPE_PAM) {
++        compas_pam_t *pam = (compas_pam_t *) *data;
++        int state = compas_pam_parse(&relay->dodag, pam,
++                                     from->peer.linklayer.sll_addr, from->peer.linklayer.sll_halen);
++
++        compas_dodag_print(&relay->dodag);
++
++        if ((state == COMPAS_PAM_RET_CODE_CURRPARENT) || (state == COMPAS_PAM_RET_CODE_NEWPARENT)) {
++#if defined(CCNL_RIOT)
++            if (exporter_pid != KERNEL_PID_UNDEF) {
++                msg_t m;
++                m.type = EXPORTER_EVENT_PARENT_REFRESH;
++                msg_try_send(&m, exporter_pid);
++            }
++#endif
++            if (relay->compas_dodag_parent_timeout) {
++                relay->compas_dodag_parent_timeout = 0;
++                if (relay->compas_nam_timer_running == 0) {
++                    relay->compas_nam_timer_running = 1;
++#ifdef CCNL_RIOT
++                    msg_try_send(&relay->compas_nam_msg, sched_active_pid);
++#else
++                    ccnl_set_timer(COMPAS_NAM_PERIOD, ccnl_compas_send_nam, relay, NULL);
++#endif
++                }
++                for (compas_nam_cache_entry_t *n = relay->dodag.nam_cache;
++                     n < relay->dodag.nam_cache + COMPAS_NAM_CACHE_LEN; ++n) {
++                    n->retries = COMPAS_NAM_CACHE_RETRIES;
++                }
++            }
++#ifdef CCNL_RIOT
++            xtimer_remove(&relay->compas_dodag_parent_timer);
++            xtimer_set_msg(&relay->compas_dodag_parent_timer,
++                           COMPAS_DODAG_PARENT_TIMEOUT_PERIOD,
++                           &relay->compas_dodag_parent_msg,
++                           sched_active_pid);
++#else
++            ccnl_rem_timer(relay->compas_dodag_parent_timer);
++            relay->compas_dodag_parent_timer = ccnl_set_timer(COMPAS_DODAG_PARENT_TIMEOUT_PERIOD, ccnl_compas_timeout, relay, NULL);
++#endif
++            /* Setup default route to new DODAG parent */
++            if (state == COMPAS_PAM_RET_CODE_NEWPARENT) {
++#if defined(CCNL_RIOT)
++                if (exporter_pid != KERNEL_PID_UNDEF) {
++                    msg_t m;
++                    m.type = EXPORTER_EVENT_PARENT_ADD;
++                    msg_try_send(&m, exporter_pid);
++                }
++#endif
++                char dodag_prfx[COMPAS_PREFIX_LEN + 1];
++                memcpy(dodag_prfx, relay->dodag.prefix.prefix, relay->dodag.prefix.prefix_len);
++                dodag_prfx[relay->dodag.prefix.prefix_len] = '\0';
++                struct ccnl_prefix_s *prefix = ccnl_URItoPrefix(dodag_prfx, CCNL_SUITE_NDNTLV, NULL, NULL);
++                ccnl_fib_rem_entry(relay, prefix, from);
++                ccnl_fib_add_entry(relay, prefix, from);
++                relay->dodag_face = from;
++
++                trickle_init(&relay->pam_trickle, TRICKLE_IMIN, TRICKLE_IMAX, TRICKLE_REDCONST);
++                uint64_t trickle_int = trickle_next(&relay->pam_trickle);
++#ifdef CCNL_RIOT
++                xtimer_remove(&relay->compas_pam_timer);
++                xtimer_set_msg64(&relay->compas_pam_timer, trickle_int * 1000,
++                               &relay->compas_pam_msg, sched_active_pid);
++#else
++                ccnl_rem_timer(relay->compas_pam_timer);
++                relay->compas_pam_timer = ccnl_set_timer(trickle_int * 1000, ccnl_compas_send_pam, relay, NULL);
++#endif
++            }
++        }
++
++    }
++    else if (cmsg->type == COMPAS_MSG_TYPE_NAM) {
++        uint16_t offset = 0;
++        compas_tlv_t *tlv;
++        char name[COMPAS_NAME_LEN + 1];
++
++        while(compas_nam_tlv_iter((compas_nam_t *) *data, &offset, &tlv)) {
++            if (tlv->type == COMPAS_TLV_NAME) {
++                unsigned char _int_buf[64];
++                compas_name_t cname;
++                compas_name_init(&cname, (const char *) (tlv + 1), tlv->length);
++                memcpy(name, cname.name, cname.name_len);
++                name[cname.name_len] = '\0';
++
++                if (relay->dodag.rank != COMPAS_DODAG_ROOT_RANK) {
++                    compas_nam_cache_entry_t *n = compas_nam_cache_find(&relay->dodag, &cname);
++                    if (!n) {
++                        compas_nam_cache_add(&relay->dodag, &cname, NULL);
++#if defined(CCNL_RIOT)
++                        if (exporter_pid != KERNEL_PID_UNDEF) {
++                            msg_t m;
++                            m.type = EXPORTER_EVENT_NAM_CACHE_ADD;
++                            m.content.ptr = NULL;
++                            msg_try_send(&m, exporter_pid);
++                        }
++#endif
++                    }
++                    if (relay->compas_nam_timer_running == 0) {
++                        relay->compas_nam_timer_running = 1;
++#ifdef CCNL_RIOT
++                        xtimer_set_msg(&relay->compas_nam_timer, COMPAS_NAM_PERIOD, &relay->compas_nam_msg, sched_active_pid);
++#else
++                        ccnl_set_timer(COMPAS_NAM_PERIOD, ccnl_compas_send_nam, relay, NULL);
++#endif
++                    }
++                }
++
++                struct ccnl_prefix_s *prefix = ccnl_URItoPrefix(name, CCNL_SUITE_NDNTLV, NULL, NULL);
++                int nonce = rand(), typ, int_len, offset;
++                offset = sizeof(_int_buf);
++                int len = ccnl_ndntlv_prependInterest(prefix, -1, &nonce, &offset, _int_buf);
++                free_prefix(prefix);
++
++                if (len > 0)
++                    memmove(_int_buf, _int_buf + offset, len);
++
++                unsigned char *data = _int_buf;
++                struct ccnl_pkt_s *pkt;
++
++                if (ccnl_ndntlv_dehead(&data, &len, (int*) &typ, &int_len) || (int) int_len > len) {
++                    free_packet(pkt);
++                    return 0;
++                }
++
++                pkt = ccnl_ndntlv_bytes2pkt(NDN_TLV_Interest, _int_buf, &data, &len);
++
++                struct ccnl_interest_s *i;
++                for (i = relay->pit; i; i = i->next) {
++                    if (ccnl_interest_isSame(i, pkt) && (i->to == from)) {
++                        break;
++                    }
++                }
++
++                if (!i) {
++                    i = ccnl_interest_new(relay, NULL, &pkt);
++                    i->to = from;
++                }
++
++                if (i) {
++                    ccnl_face_enqueue(relay, from, buf_dup(i->pkt->buf));
++                 }
++            }
++        }
++    }
++    else if (cmsg->type == COMPAS_MSG_TYPE_SOL) {
++        compas_sol_t *sol = (compas_sol_t *) *data;
++        if (compas_sol_reset_trickle(sol->flags)) {
++            trickle_init(&relay->pam_trickle, TRICKLE_IMIN, TRICKLE_IMAX, TRICKLE_REDCONST);
++            uint64_t trickle_int = trickle_next(&relay->pam_trickle);
++#ifdef CCNL_RIOT
++            xtimer_remove(&relay->compas_pam_timer);
++            xtimer_set_msg64(&relay->compas_pam_timer, trickle_int * 1000,
++                           &relay->compas_pam_msg, sched_active_pid);
++#else
++            ccnl_rem_timer(relay->compas_pam_timer);
++            relay->compas_pam_timer = ccnl_set_timer(trickle_int * 1000, ccnl_compas_send_pam, relay, NULL);
++#endif
++        }
++        else if (relay->dodag.rank != COMPAS_DODAG_UNDEF) {
++            compas_send_pam(relay, from);
++        }
++    }
++
++    return 0;
++}
++#endif
++
+ void
+ ccnl_core_init(void)
+ {
+@@ -1181,6 +1459,9 @@ ccnl_core_init(void)
+     ccnl_core_suites[CCNL_SUITE_NDNTLV].RX       = ccnl_ndntlv_forwarder;
+     ccnl_core_suites[CCNL_SUITE_NDNTLV].cMatch   = ccnl_ndntlv_cMatch;
+ #endif
++#ifdef USE_SUITE_COMPAS
++    ccnl_core_suites[CCNL_SUITE_COMPAS].RX       = ccnl_compas_forwarder;
++#endif
+ 
+ #ifdef USE_NFN
+     ZAM_init();
+diff --git a/src/ccnl-core.h b/src/ccnl-core.h
+index e7f1aae8..6c45acec 100644
+--- a/src/ccnl-core.h
++++ b/src/ccnl-core.h
+@@ -51,6 +51,14 @@
+ #endif
+ // ----------------------------------------------------------------------
+ 
++#ifdef USE_SUITE_COMPAS
++#ifdef CCNL_RIOT
++#include "xtimer.h"
++#endif
++#include "compas/routing/dodag.h"
++#include "compas/trickle.h"
++#endif
++
+ #ifdef USE_WPAN
+ /* TODO: remove when af_ieee802154.h is in linux mainline */
+ #define IEEE802154_ADDR_LEN 8
+@@ -164,6 +172,49 @@ struct ccnl_relay_s {
+     struct ccnl_krivine_s *km;
+ #endif
+ 
++#ifdef USE_SUITE_COMPAS
++    trickle_t pam_trickle;
++#define TRICKLE_IMIN        (8)
++#define TRICKLE_IMAX        (20)
++#define TRICKLE_REDCONST    (10)
++    unsigned compas_sol_num;
++#ifdef CCNL_RIOT
++#define COMPAS_PAM_MSG (0xBEEF)
++#define COMPAS_NAM_MSG (0xBEFF)
++#define COMPAS_DODAG_PARENT_TIMEOUT_MSG (0xBFFF)
++#define COMPAS_SOL_MSG (0xBEF0)
++#define COMPAS_PUB_MSG (0xBEF1)
++    xtimer_t compas_dodag_parent_timer;
++    msg_t compas_dodag_parent_msg;
++    xtimer_t compas_pam_timer;
++    msg_t compas_pam_msg;
++    xtimer_t compas_nam_timer;
++    msg_t compas_nam_msg;
++    xtimer_t compas_sol_timer;
++    msg_t compas_sol_msg;
++    kernel_pid_t pid;
++#else
++    struct ccnl_timer_s *compas_pam_timer;
++    struct ccnl_timer_s *compas_sol_timer;
++    struct ccnl_timer_s *compas_dodag_parent_timer;
++#endif
++#define COMPAS_PAM_PERIOD_BASE (300)
++#define COMPAS_PAM_PERIOD_JITTER (200)
++#define COMPAS_PAM_PERIOD (COMPAS_PAM_PERIOD_BASE * 1000 + (rand() % (COMPAS_PAM_PERIOD_JITTER * 1000)))
++#define COMPAS_NAM_PERIOD_BASE (250)
++#define COMPAS_NAM_PERIOD_JITTER (200)
++#define COMPAS_NAM_PERIOD (COMPAS_NAM_PERIOD_BASE * 1000 + (rand() % (COMPAS_NAM_PERIOD_JITTER * 1000)))
++#define COMPAS_SOL_PERIOD_BASE (2000 * 1000)
++#define COMPAS_SOL_PERIOD_JITTER (500)
++#define COMPAS_SOL_PERIOD (COMPAS_SOL_PERIOD_BASE + (rand() % (COMPAS_SOL_PERIOD_JITTER * 1000)))
++#define COMPAS_DODAG_PARENT_TIMEOUT_PERIOD (30 * 1000000)
++    compas_dodag_t dodag;
++    struct ccnl_face_s *dodag_face;
++    uint64_t compas_started;
++    unsigned compas_dodag_parent_timeout;
++    unsigned compas_nam_timer_running;
++#endif
++
+   /*
+     struct ccnl_face_s *crypto_face;
+     struct ccnl_pendcrypt_s *pendcrypt;
+@@ -260,6 +311,9 @@ struct ccnl_interest_s {
+     struct ccnl_interest_s *keepalive; // the keepalive interest dispatched for this interest
+     struct ccnl_interest_s *keepalive_origin; // the interest that dispatched this keepalive interest 
+ #endif
++#ifdef USE_SUITE_COMPAS
++    struct ccnl_face_s *to;
++#endif
+ };
+ 
+ struct ccnl_pendint_s { // pending interest
+diff --git a/src/ccnl-defs.h b/src/ccnl-defs.h
+index 6b11c55c..1bec4071 100644
+--- a/src/ccnl-defs.h
++++ b/src/ccnl-defs.h
+@@ -89,7 +89,10 @@ enum {
+ #ifdef USE_SUITE_NDNTLV
+   CCNL_SUITE_NDNTLV = 6,
+ #endif
+-  CCNL_SUITE_LAST = 7
++#ifdef USE_SUITE_COMPAS
++  CCNL_SUITE_COMPAS = 7,
++#endif
++  CCNL_SUITE_LAST = 8
+ };
+ 
+ #define CCNL_SUITE_DEFAULT (CCNL_SUITE_LAST - 1)
+@@ -105,7 +108,8 @@ enum {
+   CCNL_ENC_CCNX2014,
+   CCNL_ENC_IOT2014,
+   CCNL_ENC_LOCALRPC,
+-  CCNL_ENC_CISCO2015
++  CCNL_ENC_CISCO2015,
++  CCNL_ENC_COMPAS,
+ };
+ 
+ // ----------------------------------------------------------------------
+diff --git a/src/ccnl-pkt-switch.c b/src/ccnl-pkt-switch.c
+index 96dce9d4..27dba3cf 100644
+--- a/src/ccnl-pkt-switch.c
++++ b/src/ccnl-pkt-switch.c
+@@ -58,6 +58,9 @@ ccnl_enc2suite(int enc)
+ #endif
+ #ifdef USE_SUITE_LOCALRPC
+     case CCNL_ENC_LOCALRPC:  return CCNL_SUITE_LOCALRPC;
++#endif
++#ifdef USE_SUITE_COMPAS
++    case CCNL_ENC_COMPAS:    return CCNL_SUITE_COMPAS;
+ #endif
+     default:
+         break;
