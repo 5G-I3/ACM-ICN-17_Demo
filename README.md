@@ -20,3 +20,15 @@ The patch file is provided in [RIOT.patch](RIOT.patch) and needs to be applied o
 [RIOT-OS/RIOT@4a463c105db8b4a3b39cefc5784c25954fbac410](https://github.com/RIOT-OS/RIOT/commit/4a463c105db8b4a3b39cefc5784c25954fbac410).
 Before applying the patch file, both sections (PKG\_URL and PKG\_VERSION) in
 the file need to be adapted to point to the modified CCN-lite version (i.e. after applying [ccn-lite.patch](ccn-lite.patch)).
+
+### Demo RIOT Application
+The actual demo application is provided in [main.c](main.c) and [Makefile](Makefile).
+The binary is flashed onto three [PhyNodes](https://github.com/RIOT-OS/RIOT/wiki/Board:-Phytec-phyWAVE-KW22).
+The [Makefile](Makefile) needs to be adapted, so that the *RIOTBASE* variable points to
+the patched RIOT version. In our demo, each of the three PhyNodes has a specific task
+and the binary is built via *NODE_A=1 make ...*, *NODE_B=1 make ...* and *NODE_C=1 make ...*.
+
+On the linux side, the patched CCN-Lite version is built with the *USE_WPAN=1* flag
+and is started on a *wpan* interface with the *-w* flag.
+In our demo, we used a RaspberryPi 3 with an [openlabs](http://openlabs.co/OSHW/Raspberry-Pi-802.15.4-radio) transceiver.
+Our IEEE 802.15.4 setup is outlined in this [wiki](https://github.com/RIOT-Makers/wpan-raspbian/wiki/Create-a-generic-Raspbian-image-with-6LoWPAN-support).
