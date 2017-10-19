@@ -32,3 +32,14 @@ On the linux side, the patched CCN-Lite version is built with the *USE_WPAN=1* f
 and is started on a *wpan* interface with the *-w* flag.
 In our demo, we used a RaspberryPi 3 with an [openlabs](http://openlabs.co/OSHW/Raspberry-Pi-802.15.4-radio) transceiver.
 Our IEEE 802.15.4 setup is outlined in this [wiki](https://github.com/RIOT-Makers/wpan-raspbian/wiki/Create-a-generic-Raspbian-image-with-6LoWPAN-support).
+
+### ACM ICN Demo Wireshark Post-Dissector
+We provide a wireshark post-dissector in [acmicndemo.lua](acmicndemo.lua) that
+decodes the messages of the control plane. It also provides additional information
+to provide a comfortable way to filter the pcap trace by PhyNode names or messages types.
+
+### Sniffer
+In our demo, we used a secondary RaspberryPi 3 to monitor the traffic. This sniffer
+Raspberry Pi parses the traffic and sends MQTT JSON messages to the gateway Raspberry Pi.
+The gateway Raspberry Pi then uses the JSON messages to display the topology and the traffic
+visually in a dashboard. The sniffer scripts can be found in [sniffer/pcap_parser.py](sniffer/pcap_parser.py) and [sniffer/sniffer.sh](sniffer/sniffer.sh).
