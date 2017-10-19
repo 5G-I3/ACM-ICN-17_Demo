@@ -43,3 +43,8 @@ In our demo, we used a secondary RaspberryPi 3 to monitor the traffic. This snif
 Raspberry Pi parses the traffic and sends MQTT JSON messages to the gateway Raspberry Pi.
 The gateway Raspberry Pi then uses the JSON messages to display the topology and the traffic
 visually in a dashboard. The sniffer scripts can be found in [sniffer/pcap_parser.py](sniffer/pcap_parser.py) and [sniffer/sniffer.sh](sniffer/sniffer.sh).
+
+### Dashboard
+The information provided by the sniffer is visualized in the dashboard provided in
+[dashboard](dashboard). JSON messages are received via MQTT and parsed to draw the current topology
+using the d3.js JavaScript library.
